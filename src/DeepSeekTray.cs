@@ -111,6 +111,37 @@ namespace DeepSeekTray
 
     #region win32
 
+    #region shell property store interop
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    internal struct PROPERTYKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    /// <summary>Only the string case is used, so the union is modelled as a single
+    /// pointer at offset 8 — the layout is the same on x86 and x64.</summary>
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct PROPVARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr pointer;
+    }
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IPropertyStore
+    {
+        int GetCount(out uint count);
+        int GetAt(uint index, out PROPERTYKEY key);
+        int GetValue(ref PROPERTYKEY key, out PROPVARIANT value);
+        int SetValue(ref PROPERTYKEY key, ref PROPVARIANT value);
+        int Commit();
+    }
+
+    #endregion
+
     internal static class Native
     {
         // ---- job object: kill-on-close ownership of every child we start ----
@@ -271,9 +302,19 @@ namespace DeepSeekTray
         /// bubbles — which share the app's window class and would otherwise be
         /// matched first. Those have an owner window; the real app window does not,
         /// and is the largest of the candidates.</summary>
-        public static bool FocusWindowOf(HashSet<int> pids)
+        public static IntPtr FocusWindowOf(HashSet<int> pids)
         {
-            if (pids == null || pids.Count == 0) return false;
+            IntPtr window = FindWindowOf(pids);
+            if (window == IntPtr.Zero) return IntPtr.Zero;
+            ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
+            ForceForeground(window);
+            return window;
+        }
+
+        /// <summary>The app window handle, or IntPtr.Zero.</summary>
+        public static IntPtr FindWindowOf(HashSet<int> pids)
+        {
+            if (pids == null || pids.Count == 0) return IntPtr.Zero;
 
             IntPtr best = IntPtr.Zero;
             long bestArea = 0;
@@ -298,10 +339,7 @@ namespace DeepSeekTray
                 return true;
             }, IntPtr.Zero);
 
-            if (best == IntPtr.Zero) return false;
-            ShowWindow(best, IsIconic(best) ? SW_RESTORE : SW_SHOW);
-            ForceForeground(best);
-            return true;
+            return best;
         }
 
         /// <summary>Raise a window past the foreground lock. Windows only lets the
@@ -340,6 +378,84 @@ namespace DeepSeekTray
         public static void AllowForeground(int processId)
         {
             try { AllowSetForegroundWindow(processId); } catch { }
+        }
+
+        // ---- taskbar identity for the app window ----
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr LoadImage(IntPtr instance, string name, uint type,
+            int cx, int cy, uint load);
+
+        [DllImport("shell32.dll")]
+        private static extern int SHGetPropertyStoreForWindow(IntPtr hWnd, ref Guid iid,
+            [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref PROPVARIANT value);
+
+        private const uint WM_SETICON = 0x0080;
+        private const uint IMAGE_ICON = 1;
+        private const uint LR_LOADFROMFILE = 0x0010;
+        private const int ICON_SMALL = 0;
+        private const int ICON_BIG = 1;
+        private const ushort VT_LPWSTR = 31;
+
+        private static readonly Guid AppUserModelFormat = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+        private static readonly Guid PropertyStoreIid = new Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99");
+
+        /// <summary>Give the browser's app window our own taskbar button: its own
+        /// icon, its own grouping, its own name.
+        ///
+        /// A Chromium `--app` window is still a browser window as far as the shell is
+        /// concerned, so without this it shows up under Edge's icon and gets grouped
+        /// with the user's browsing. WM_SETICON fixes the window's own icon;
+        /// PKEY_AppUserModel_ID gives it a separate taskbar identity, and
+        /// RelaunchIconResource is the icon the shell draws for it.</summary>
+        public static void BrandWindow(IntPtr hWnd, string icoPath, string appId,
+                                       string displayName, string relaunchCommand)
+        {
+            if (hWnd == IntPtr.Zero) return;
+            try
+            {
+                if (File.Exists(icoPath))
+                {
+                    IntPtr big = LoadImage(IntPtr.Zero, icoPath, IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+                    IntPtr small = LoadImage(IntPtr.Zero, icoPath, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+                    if (big != IntPtr.Zero) SendMessage(hWnd, WM_SETICON, (IntPtr)ICON_BIG, big);
+                    if (small != IntPtr.Zero) SendMessage(hWnd, WM_SETICON, (IntPtr)ICON_SMALL, small);
+                }
+
+                IPropertyStore store;
+                Guid iid = PropertyStoreIid;
+                if (SHGetPropertyStoreForWindow(hWnd, ref iid, out store) != 0 || store == null) return;
+                try
+                {
+                    SetStringProperty(store, 5, appId);                  // PKEY_AppUserModel_ID
+                    if (File.Exists(icoPath))
+                        SetStringProperty(store, 3, icoPath + ",0");     // RelaunchIconResource
+                    SetStringProperty(store, 4, displayName);            // RelaunchDisplayNameResource
+                    SetStringProperty(store, 2, relaunchCommand);        // RelaunchCommand
+                    store.Commit();
+                }
+                finally { Marshal.ReleaseComObject(store); }
+            }
+            catch { }
+        }
+
+        private static void SetStringProperty(IPropertyStore store, uint propertyId, string value)
+        {
+            PROPERTYKEY key = new PROPERTYKEY();
+            key.fmtid = AppUserModelFormat;
+            key.pid = propertyId;
+
+            PROPVARIANT variant = new PROPVARIANT();
+            variant.vt = VT_LPWSTR;
+            variant.pointer = Marshal.StringToCoTaskMemUni(value);
+            try { store.SetValue(ref key, ref variant); }
+            finally { PropVariantClear(ref variant); }
         }
 
         // ---- who owns the listening port ----
@@ -823,8 +939,9 @@ namespace DeepSeekTray
         /// window for an app that is already on screen.</summary>
         public static void OpenOrFocus()
         {
-            if (FocusKnownWindow()) return;
-            if (Native.FocusWindowOf(Pids(Procs.Snapshot()))) return;
+            IntPtr existing = FocusKnownWindow();
+            if (existing == IntPtr.Zero) existing = Native.FocusWindowOf(Pids(Procs.Snapshot()));
+            if (existing != IntPtr.Zero) { Brand(existing); return; }
 
             string browser = Paths.BrowserExe();
             if (browser == null) { OpenInDefaultBrowser(); return; }
@@ -852,23 +969,52 @@ namespace DeepSeekTray
                 psi.UseShellExecute = false;
                 Process p = Process.Start(psi);
                 Native.Adopt(p);
-                if (p != null) lastBrowserPid = p.Id;
+                if (p != null)
+                {
+                    lastBrowserPid = p.Id;
+                    BrandWhenReady(p.Id);
+                }
             }
             catch { OpenInDefaultBrowser(); }
         }
 
-        private static bool FocusKnownWindow()
+        /// <summary>Claim the taskbar button for a window we already have.</summary>
+        private static void Brand(IntPtr window)
+        {
+            Native.BrandWindow(window, Paths.In("app.ico"), AppUserModelId,
+                               "DeepSeek Harness", "\"" + Application.ExecutablePath + "\"");
+        }
+
+        /// <summary>The browser creates its window asynchronously, so wait for it —
+        /// polling only that one process, never the whole process table.</summary>
+        private static void BrandWhenReady(int browserPid)
+        {
+            HashSet<int> pids = new HashSet<int>();
+            pids.Add(browserPid);
+            for (int i = 0; i < 40; i++)
+            {
+                IntPtr window = Native.FindWindowOf(pids);
+                if (window != IntPtr.Zero) { Brand(window); return; }
+                Thread.Sleep(400);
+            }
+        }
+
+        /// <summary>Taskbar identity. Stable across restarts so a pinned button keeps
+        /// pointing at the same app.</summary>
+        private const string AppUserModelId = "DeepSeekHarness.Tray.AppWindow";
+
+        private static IntPtr FocusKnownWindow()
         {
             int pid = lastBrowserPid;
-            if (pid == 0) return false;
+            if (pid == 0) return IntPtr.Zero;
             try
             {
                 using (Process p = Process.GetProcessById(pid))
                 {
-                    if (p.HasExited) { lastBrowserPid = 0; return false; }
+                    if (p.HasExited) { lastBrowserPid = 0; return IntPtr.Zero; }
                 }
             }
-            catch { lastBrowserPid = 0; return false; }
+            catch { lastBrowserPid = 0; return IntPtr.Zero; }
 
             HashSet<int> one = new HashSet<int>();
             one.Add(pid);
