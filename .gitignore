@@ -1,0 +1,13 @@
+# 编译产物
+bin/
+*.exe
+*.pdb
+
+# 运行时产生的东西
+logs/
+app-window-profile/
+tray.settings
+
+# Python
+__pycache__/
+*.pyc
